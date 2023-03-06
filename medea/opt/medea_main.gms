@@ -5,7 +5,6 @@ $title medea
 * - investment in storage capacity
 * - derived post-solution variables
 * - switches for different model options (short-run/long-run, ancillary services, ...) **** better to implement in python
-* - spatially resolved investment in plants / nodes or cells
 * - enable fuel trade in supply-demand balance
 * - activate transmission technologies
 
@@ -49,10 +48,11 @@ Sets
          d(t)                       dispatchable technologies  - prev "i"
          r(t)                       intermittent technologies  - prev "n"
          s(t)                       storage technologies       - prev "k"
-         g(t)                       transmission technologies / e_grid, ht_grid, h2_grid /
+*         g(t)                       transmission technologies
          l                          limits of feasible operating regions of CHPs
          h                          time \ hours               - prev "t"
          z                          market zones
+         rz                         resource zones
 ;
 alias(z,zz);
 * ------------------------------------------------------------------------------
@@ -62,6 +62,7 @@ Parameters
          ANNUITY_FACTOR(z,t)        annuity factor for investment cost
          ANNUITY_FACTOR_X(z,f)      annuity factor for grid investment cost
          CAPACITY(z,t)              installed capacity of conversion units [GW]
+         CAPACITY_RE(z,rz,r)        capacity of intermittents installed in resource zone [GW]
          CAPACITY_X(z,zz,f)         initial transmission capacity [GW]
          CAPACITY_STORAGE(z,f,s)    volume of storage [GWh]
          CAPACITY_STORE_IN(z,f,s)   capacity to store in [GW]
@@ -90,11 +91,14 @@ Parameters
          OVERNIGHTCOST_X(f)         overnight investment cost of transmission expansion
          PEAK_LOAD(z)               maximum electricity load [GW]
          PEAK_PROFILE(z,i)          maximum share of generation from intermittent sources [%]
+         POTENTIAL(z,rz,r)          maximum deployable intermittent capacity per resource zone [GW]
          PRICE_CO2(z,h)             price of CO2 emissions [EUR per t CO2]
          PRICE(z,h,i)               price of energy carrier [EUR per MWh]
          PRICE_TRADE(f)             price of imported energy carriers [EUR per MWh]
          PROFILE(z,h,i)             intermittent generation profile
+         PROFILES_RZ(z,rz,h,i)      intermittent generation profile in resource zone
          SIGMA(z)                   intermittent generation scaling factor for system service requirement
+         STORAGE_LEVEL(s)           energy content of storages in first and last period [GWh]
          VALUE_NSE(z)               value of non-served energy [EUR]
          SWITCH_INVEST              switches between long-term and short-term perspective
 ;
@@ -114,7 +118,7 @@ $load    CAPACITY_STORE_IN CAPACITY_STORE_OUT OVERNIGHTCOST OVERNIGHTCOST_E
 $load    OVERNIGHTCOST_P OVERNIGHTCOST_X CONVERSION CO2_INTENSITY COST_OM_QFIX
 $load    COST_OM_VAR DEMAND DISCOUNT_RATE DISTANCE FEASIBLE_INPUT FEASIBLE_OUTPUT
 $load    INFLOWS LAMBDA LIFETIME MAP_INPUTS MAP_OUTPUTS PEAK_LOAD PEAK_PROFILE
-$load    PRICE PRICE_CO2 PRICE_TRADE PROFILE SIGMA SWITCH_INVEST VALUE_NSE
+$load    PRICE PRICE_CO2 PRICE_TRADE PROFILE SIGMA STORAGE_LEVEL SWITCH_INVEST VALUE_NSE
 $gdxin
 
 * ------------------------------------------------------------------------------
@@ -125,13 +129,14 @@ $if %SYNGAS% == yes FEASIBLE_INPUT(i,l,'Syngas') = FEASIBLE_INPUT(i,l,'Gas');
 
 * ------------------------------------------------------------------------------
 * derived parameters
+$onText
 ANNUITY_FACTOR(z,t) = (DISCOUNT_RATE(z)*(1+DISCOUNT_RATE(z))**LIFETIME(t)) / ((1+DISCOUNT_RATE(z))**LIFETIME(t)-1);
 ANNUITY_FACTOR_X(z,f) = (DISCOUNT_RATE(z)*(1+DISCOUNT_RATE(z))**LIFETIME('transmission')) / ((1+DISCOUNT_RATE(z))**LIFETIME('transmission')-1);
 CAPITALCOST(z,t) = OVERNIGHTCOST(t) * ANNUITY_FACTOR(z,t);
 CAPITALCOST_E(z,s) = OVERNIGHTCOST_E(s) * ANNUITY_FACTOR(z,s);
 CAPITALCOST_P(z,s) = OVERNIGHTCOST_P(s) * ANNUITY_FACTOR(z,s);
 CAPITALCOST_X(z,f) = OVERNIGHTCOST_X(f) * ANNUITY_FACTOR_X(z,f);
-
+$offText
 * ------------------------------------------------------------------------------
 Variables
          cost_system                total system cost [kEUR]
@@ -151,10 +156,12 @@ Positive Variables
         cost_trade(z,f)             cost of trade in energy carriers
         curtail(z,h,f)              discarded energy output
         decommission(z,t)           capacity decommissioned
+        recommission(z,rz,r)        intermittent capacity decommissioned
         emission_co2(z,h,i)         quantity of CO2 emitted
         fuel_trade(z,h,f)           fuel shipment
         gen(z,h,f,t)                energy generation
-        invest(z,t)                 capacity investmed
+        invest(z,t)                 capacity invested
+        reinvest(z,rz,r)            investment in intermittent technologies
         nse(z,h,f)                  non-served energy
         storage_content(z,h,f,s)    storage capacity
         use(z,h,e,t)                energy use (endogenous)
@@ -176,7 +183,8 @@ balance, intermittent_generation, energy_conversion, capacity_constraint,
 storage_balance,storage_limit,store_in_limit,store_out_limit,
 bal_w_chp,uplim_g_chp,lolim_b_chp,
 uplim_transmission,lolim_transmission,bal_transmission,bal_add_x,
-bal_co2, acn_airpollute,limit_curtail,ancillary_services
+bal_co2, acn_airpollute,limit_curtail,ancillary_services,
+limit_intermittent_potentials,intermittent_invest_balance,intermittent_decom_balance
 ;
 * ==============================================================================
 
@@ -191,16 +199,16 @@ w.UP(z,h,c,l,i)$(NOT MAP_INPUTS(i,c)) = 0;
 w.UP(z,h,c,l,i)$(NOT FEASIBLE_INPUT(l,i,c)) = 0;
 storage_content.UP(z,h,f,s)$(NOT MAP_OUTPUTS(f,s)) = 0;
 storage_content.UP(z,h,f,s)$(NOT MAP_INPUTS(f,s)) = 0;
+storage_content.FX(z,h,f,s)$(ord(h) eq 1) = STORAGE_LEVEL(s);
+storage_content.FX(z,h,f,s)$(ord(h) eq card(h)) = STORAGE_LEVEL(s);
 x.FX(z,zz,h,f)$SAMEAS(z,zz) = 0;
 x.FX(zz,z,h,f)$SAMEAS(z,zz) = 0;
 x.FX(zz,z,h,'ht') = 0;
 emission_co2.UP(z,h,i)$(NOT CO2_INTENSITY(i)) = 0;
-curtail.UP(z,h,f)$(NOT MAP_OUTPUTS(f,r)) = 0;
+*curtail.UP(z,h,f)$(NOT MAP_OUTPUTS(f,r)) = 0;
 fuel_trade.UP(z,h,f)$(NOT PRICE_TRADE(f)) = 0;
 decommission.UP(z,t) = CAPACITY(z,t);
 invest.UP(z,t) =  SWITCH_INVEST;
-
-* add_x.UP(z,zz,f)
 
 * ------------------------------------------------------------------------------
 * TOTAL SYSTEM COST AND ITS COMPONENTS
@@ -220,7 +228,7 @@ acc_zonal(z)..
          + sum(f, cost_grid(z,f) )
          + sum(f, cost_nse(z,f) )
          + sum(f, cost_trade(z,f) )
-;
+         ;
 acc_inputs(z,i,t)$MAP_INPUTS(i,t)..
          cost_inputs(z,i,t)
          =E=
@@ -289,8 +297,23 @@ capacity_constraint(z,h,f,t)$MAP_OUTPUTS(f,t)..
 intermittent_generation(z,h,i,r)..
          use(z,h,i,r)$MAP_INPUTS(i,r)
          =E=
-         PROFILE(z,h,i)$MAP_INPUTS(i,r) * (CAPACITY(z,r) + invest(z,r) - decommission(z,r))
+         sum(rz, PROFILES_RZ(z,rz,h,i)$MAP_INPUTS(i,r) * (CAPACITY_RE(z,rz,r) + reinvest(z,rz,r) - recommission(z,rz,r)))
 ;
+limit_intermittent_potentials(z,rz,r)$(POTENTIAL(z,rz,r))..
+        reinvest(z,rz,r) - recommission(z,rz,r)
+        =L=
+        POTENTIAL(z,rz,r)
+;
+intermittent_invest_balance(z,r)..
+        sum(rz, reinvest(z,rz,r))
+        =E=
+        invest(z,r)
+;
+intermittent_decom_balance(z,r)..
+        sum(rz, recommission(z,rz,r))
+        =E=
+        decommission(z,r)
+;        
 * Energy Conversion With Fixed Efficiency
 energy_conversion(z,h,f,t)$(MAP_OUTPUTS(f,t) AND NOT c(t) AND NOT s(t))..
          gen(z,h,f,t)
@@ -384,7 +407,7 @@ ancillary_services(z,h)..
          + sum(t, use(z,h,'el',t))
          =G=
          LAMBDA(z) * PEAK_LOAD(z)
-         + SIGMA * sum(r$(NOT SAMEAS(r,'ror')), sum(i,PEAK_PROFILE(z,i) * MAP_INPUTS(i,r)) * (CAPACITY(z,r) + invest(z,r) - decommission(z,r)) )
+         + SIGMA(z) * sum(r$(NOT SAMEAS(r,'ror')), sum(i,PEAK_PROFILE(z,i) * MAP_INPUTS(i,r)) * (CAPACITY(z,r) + invest(z,r) - decommission(z,r)) )
 ;
 
 * ==============================================================================
@@ -400,7 +423,7 @@ model medea / all /;
 
 options
 reslim = 54000,
-threads = 8,
+threads = 4,
 optCR = 0.01,
 BRatio = 1
 ;
@@ -448,30 +471,28 @@ Cost_OnM(z,t) = COST_OM_QFIX(z,t) * (CAPACITY(z,t) + invest.L(z,t)) + sum((h,f),
 Cost_Zonal(z) = sum((i,t,f),COST_FUEL(z,i,t) + COST_CO2(z,i) + COST_ONM(z,t) + COST_INVEST(z,t) + COST_INTERCONNECT(z,f) );
 
 display Cost_CO2,Cost_Fuel,Cost_Interconnect,Cost_Invest,Cost_OnM,Cost_Zonal;
-$offtext
+
 parameters
 AnnRenShare(z)                   renewables generation divided by electricity consumption
 AnnG(z,f)                        annual thermal generation
 AnnGByTec(z,i,t,f)               annual thermal generation by technology
-AnnGFossil(z)                    annual generation from fossil sources
-AnnGSyngas(z)                    annual generation from synthetic gases
-AnnGBiomass(z)                   annual generation from biomass
+*AnnGFossil(z)                    annual generation from fossil sources
+*AnnGSyngas(z)                    annual generation from synthetic gases
+*AnnGBiomass(z)                   annual generation from biomass
 AnnR(z)                          annual generation from renewable sources
 AnnSIn(z)                        annual consumption of electricity storages
 AnnSOut(z)                       annual generation of electricity storages
 AnnCons(z,f)                     annual consumption of electricity and heat
 AnnFullLoadHours(z,r)            annual full load hours of renewable technologies
 AnnX(z)                          annual electricity exports
-AnnB(z,i)                        annual fuel burn
 AnnCO2Emissions(z)               annual CO2 emissions
 AnnCurtail(z)                    annual curtailment of generation from renewables
-AnnValueG(z,f)                   annual value of thermal generation
-AnnValueGByTec(z,t,f)            annual value of thermal generation by technology
-AnnValueSIn(z)                   annual value of electricity consumed by storages
+AnnValueGen(z,t)                 annual value of final energy generation
+AnnValueSIn(z,f,s)               annual value of electricity consumed by storages
 AnnValueSOut(z)                  annual value of electricity generated by storages
 AnnValueX(z,zz)                  annual value of electricity exports
 AnnValueCurtail(z)               annual value of electricity curtailed
-AnnCostG(z,t)                    annual cost of thermal generators
+AnnCostGen(z,t)                  annual cost of thermal generators
 AnnRevenueG(z,t)                 annual revenue of thermal generators
 AnnProfitG(z,t)                  annual profit of thermal generators
 AnnProfitS(z,s)                  annual profit of storages
@@ -492,135 +513,41 @@ HourlyPriceSystemServices(z,h)   hourly price of system services
 * ------------------------------------------------------------------------------
 * parameter calculation
 *AnnRenShare(z) = (sum((t,n), r.L(z,t,n) ) + sum((t,k), s_out.L(z,t,k) ) - sum((t,k), s_in.L(z,t,k) ) + sum((t,i), g.L(z,t,i,'el','Biomass') ) + sum((t,i), g.L(z,t,i,'el','Syngas') ) ) / sum(t, DEMAND(z,t,'el') );
-*AnnG(z,f) = sum((t,i,f), g.L(z, t, i, f, f));
-*AnnGByTec(z,i,f,f) = sum(t, g.L(z, t, i, f, f));
-*AnnGSyngas(z) = sum((t,i), g.L(z,t,i,'el','Syngas') );
-*AnnGBiomass(z) = sum((t,i), g.L(z,t,i,'el','Biomass') );
-*AnnGFossil(z) = sum(f, AnnG(z,f)) - AnnGSyngas(z) - AnnGBiomass(z);
-*AnnR(z) = sum((t,n), r.L(z,t,n) );
-*AnnSIn(z) = sum((t,k), s_in.L(z,t,k));
-*AnnSOut(z) = sum((t,k), s_out.L(z,t,k));
-*AnnCons(z,f) = sum(t, DEMAND(z,t,f));
-*AnnFullLoadHours(z,n) = sum(t, GEN_PROFILE(z,t,n));
-*AnnX(zz) = sum(t, x.L('AT',zz,t));
-*AnnB(z,f) = sum((t,i), b.L(z,t,i,f));
-*AnnCO2Emissions(z) = sum((t,i), emission_co2.L(z,t,i));
-*AnnCurtail(z) = sum(t, q_curtail.L(z,t));
-*AnnValueG(z,f) = sum((t,i,f), bal_el.M(z,t) * g.L(z,t,i,f,f));
-*AnnValueGByTec(z,i,f) = sum((t,f), bal_el.M(z,t) * g.L(z,t,i,f,f));
-*AnnValueSIn(z) = sum((t,k), bal_el.M(z,t) * s_in.L(z,t,k));
-*AnnValueSOut(z) = sum((t,k), bal_el.M(z,t) * s_out.L(z,t,k));
-*AnnValueX(z,zz) = sum(t, bal_el.M(z,t) * x.L(z,zz,t));
-*AnnValueCurtail(z) = sum(t, bal_el.M(z,t) * q_curtail.L(z,t));
-*AnnCostG(z,i) = sum(t, cost_fuel.L(z,t,i) + cost_co2.L(z,t,i) ) + cost_om_g.L(z,i);
-*AnnRevenueG(z,i) = sum((t,f), bal_el.M(z,t) * g.L(z,t,i,'el',f) + bal_ht.M(z,t) * g.L(z,t,i,'ht',f) );
-*AnnProfitG(z,i) = AnnRevenueG(z,i) - AnnCostG(z,i);
-*AnnProfitS(z,k) = sum(t, bal_el.M(z,t) * s_out.L(z,t,k) - bal_el.M(z,t) * s_in.L(z,t,k) );
-*AnnProfitR(z,n) = sum(t, bal_el.M(z,t) * r.L(z,t,n) ) - cost_om_r.L(z,n);
+* gen(z,h,f,t)
+AnnGen(z,f) = sum((h,t), gen.L(z, h, f, t));
+AnnGenByTec(z,f,t) = sum(h, gen.L(z, h, f, t));
+AnnR(z,f) = sum((h,r), gen.L(z,h,f,r) );
+AnnSIn(z,f) = sum((h,s), use.L(z,h,f,s));
+AnnSOut(z,f) = sum((h,s), gen.L(z,h,f,s));
+AnnCons(z,f) = sum(h, DEMAND(z,h,f));
+AnnFullLoadHours(z,i) = sum(h, PROFILE(z,h,i));
+AnnX(z,zz,f) = sum(h, x.L(z,zz,h,f));
+AnnCO2Emissions(z) = sum((h,i), emission_co2.L(z,h,i));
+AnnCurtail(z,f) = sum(h, curtail.L(z,h,f));
+AnnValueGen(z,t) = sum((h,f), balance.M(z,h,f) * gen.L(z,h,f,t));
+AnnValueSIn(z,f,s) = sum(h, balance.M(z,h,f) * use(z,h,f,s));
+AnnValueSOut(z,f,s) = sum(h, balance.M(z,h,f) * gen.L(z,h,f,s));
+AnnValueX(z,zz) = sum(h, balance.M(z,h,f) * x.L(z,zz,h));
+AnnValueCurtail(z,f) = sum(h, balance.M(z,h,f) * curtail.L(z,h,f));
+AnnCostGen(z,t) = sum((h,i), cost_inputs.L(z,i,t) + cost_emissions.L(z,i) ) + cost_om.L(z,t);
+AnnRevenueG(z,t) = sum((h,f), balance.M(z,h,f) * gen.L(z,h,f,t));
+AnnProfitG(z,t) = AnnRevenueG(z,t) - AnnCostG(z,t);
+AnnProfitS(z,f,s) = sum(h, balance.M(z,h,f) * gen.L(z,h,f,s) - balance.M(z,h,f) * use.L(z,h,f,s) );
+AnnProfitR(z,f,r) = sum(h, balance.M(z,h,f) * gen.L(z,h,f,r) ) - cost_om.L(z,r);
 *AnnSurplusG(z,i) = AnnRevenueG(z,i) - sum(t, cost_fuel.L(z,t,i) + cost_co2.L(z,t,i) ) - sum((t,f,f), OM_COST_G_VAR(i) * g.L(z,t,i,f,f) );
 *AnnProdSurplus(z) = sum(i, AnnSurplusG(z,i)) + sum(k, AnnProfitS(z,k)) + sum((t,n), bal_el.M(z,t) * r.L(z,t,n)) - sum((t,n), OM_COST_R_VAR(z,n) * r.L(z,t,n) );
-*AnnSpendingEl(z) =  sum(t, bal_el.M(z,t) * DEMAND(z,t,'el') );
-*AnnSpendingHt(z) =  sum(t, bal_ht.M(z,t) * DEMAND(z,t,'ht') );
-*AnnSpending(z) =  AnnSpendingEl(z) + AnnSpendingHt(z);
-*AvgPriceFuels(z,f) = sum(t, PRICE_FUEL(z,t,f)) / card(t);
-*AvgPriceCO2(z) = sum(t, PRICE_CO2(z,t)) / card(t);
-*AvgPriceEl(z) = sum(t, bal_el.M(z,t))/card(t);
-*AvgPriceHt(z) = sum(t, bal_ht.M(z,t))/card(t);
-*HourlyPriceEl(z,t) = bal_el.M(z,t);
-*HourlyPriceHt(z,t) = bal_ht.M(z,t);
+AnnSpending(z,f) =  sum(h, balance.M(z,h,f) * DEMAND(z,h,f) );
+AnnUse(z,e) = sum((h,t), use.L(z,h,e,t));
+AnnUseByTec(z,e,t) = sum(h, use.L(z,h,e,t));
+AvgPriceFuels(z,i) = sum(h, PRICE(z,h,i)) / card(h);
+AvgPriceCO2(z) = sum(h, PRICE_CO2(z,h)) / card(h);
+AvgPriceEnergy(z,f) = sum(h, balance.M(z,h,f))/card(h);
+HourlyPriceEnergy(z,h,f) = balance.M(z,h,f);
 *HourlyPriceSystemServices(z,t) = lolim_ancservices.M(z,t);
-
-* ==============================================================================
-* THE END
-* ==============================================================================
-* this line intentionally left blank
-
-
-$ontext
-* ------------------------------------------------------------------------------
-* EX-POST ANALYSIS
-* parameters summarizing model solution - CamelCaseStyle beginning with Ann
-parameters
-AnnRenShare(z)                   renewables generation divided by electricity consumption
-AnnG(z,m)                        annual thermal generation
-AnnGByTec(z,i,m,f)               annual thermal generation by technology
-AnnGFossil(z)                    annual generation from fossil sources
-AnnGSyngas(z)                    annual generation from synthetic gases
-AnnGBiomass(z)                   annual generation from biomass
-AnnR(z)                          annual generation from renewable sources
-AnnSIn(z)                        annual consumption of electricity storages
-AnnSOut(z)                       annual generation of electricity storages
-AnnCons(z,m)                     annual consumption of electricity and heat
-AnnFullLoadHours(z,n)            annual full load hours of renewable technologies
-AnnX(z)                          annual electricity exports
-AnnB(z,f)                        annual fuel burn
-AnnCO2Emissions(z)               annual CO2 emissions
-AnnCurtail(z)                    annual curtailment of generation from renewables
-AnnValueG(z,m)                   annual value of thermal generation
-AnnValueGByTec(z,i,m)            annual value of thermal generation by technology
-AnnValueSIn(z)                   annual value of electricity consumed by storages
-AnnValueSOut(z)                  annual value of electricity generated by storages
-AnnValueX(z,zz)                  annual value of electricity exports
-AnnValueCurtail(z)               annual value of electricity curtailed
-AnnCostG(z,i)                    annual cost of thermal generators
-AnnRevenueG(z,i)                 annual revenue of thermal generators
-AnnProfitG(z,i)                  annual profit of thermal generators
-AnnProfitS(z,k)                  annual profit of storages
-AnnProfitR(z,n)                  annual profit of renewable generators
-AnnSurplusG(z,i)                 annual surplus of thermal generators
-AnnProdSurplus(z)                annual producer surplus
-AnnSpendingEl(z)                 annual consumer spending on electricity
-AnnSpendingHt(z)                 annual consumer spending on heat
-AnnSpending(z)                   annual consumer spending on electricity and heat
-AvgPriceFuels(z,f)               annual average price of fuels
-AvgPriceCO2(z)                   annual average price of CO2 emissions
-AvgPriceEl(z)                    annual average price of electricity
-AvgPriceHt(z)                    annual average price of heat
-HourlyPriceEl(z,t)               hourly price of electricity
-HourlyPriceHt(z,t)               hourly price of heat
-HourlyPriceSystemServices(z,t)   hourly price of system services
-;
-* ------------------------------------------------------------------------------
-* parameter calculation
-AnnRenShare(z) = (sum((t,n), r.L(z,t,n) ) + sum((t,k), s_out.L(z,t,k) ) - sum((t,k), s_in.L(z,t,k) ) + sum((t,i), g.L(z,t,i,'el','Biomass') ) + sum((t,i), g.L(z,t,i,'el','Syngas') ) ) / sum(t, DEMAND(z,t,'el') );
-AnnG(z,m) = sum((t,i,f), g.L(z, t, i, m, f));
-AnnGByTec(z,i,m,f) = sum(t, g.L(z, t, i, m, f));
-AnnGSyngas(z) = sum((t,i), g.L(z,t,i,'el','Syngas') );
-AnnGBiomass(z) = sum((t,i), g.L(z,t,i,'el','Biomass') );
-AnnGFossil(z) = sum(m, AnnG(z,m)) - AnnGSyngas(z) - AnnGBiomass(z);
-AnnR(z) = sum((t,n), r.L(z,t,n) );
-AnnSIn(z) = sum((t,k), s_in.L(z,t,k));
-AnnSOut(z) = sum((t,k), s_out.L(z,t,k));
-AnnCons(z,m) = sum(t, DEMAND(z,t,m));
-AnnFullLoadHours(z,n) = sum(t, GEN_PROFILE(z,t,n));
-AnnX(zz) = sum(t, x.L('AT',zz,t));
-AnnB(z,f) = sum((t,i), b.L(z,t,i,f));
-AnnCO2Emissions(z) = sum((t,i), emission_co2.L(z,t,i));
-AnnCurtail(z) = sum(t, q_curtail.L(z,t));
-AnnValueG(z,m) = sum((t,i,f), bal_el.M(z,t) * g.L(z,t,i,m,f));
-AnnValueGByTec(z,i,m) = sum((t,f), bal_el.M(z,t) * g.L(z,t,i,m,f));
-AnnValueSIn(z) = sum((t,k), bal_el.M(z,t) * s_in.L(z,t,k));
-AnnValueSOut(z) = sum((t,k), bal_el.M(z,t) * s_out.L(z,t,k));
-AnnValueX(z,zz) = sum(t, bal_el.M(z,t) * x.L(z,zz,t));
-AnnValueCurtail(z) = sum(t, bal_el.M(z,t) * q_curtail.L(z,t));
-AnnCostG(z,i) = sum(t, cost_fuel.L(z,t,i) + cost_co2.L(z,t,i) ) + cost_om_g.L(z,i);
-AnnRevenueG(z,i) = sum((t,f), bal_el.M(z,t) * g.L(z,t,i,'el',f) + bal_ht.M(z,t) * g.L(z,t,i,'ht',f) );
-AnnProfitG(z,i) = AnnRevenueG(z,i) - AnnCostG(z,i);
-AnnProfitS(z,k) = sum(t, bal_el.M(z,t) * s_out.L(z,t,k) - bal_el.M(z,t) * s_in.L(z,t,k) );
-AnnProfitR(z,n) = sum(t, bal_el.M(z,t) * r.L(z,t,n) ) - cost_om_r.L(z,n);
-AnnSurplusG(z,i) = AnnRevenueG(z,i) - sum(t, cost_fuel.L(z,t,i) + cost_co2.L(z,t,i) ) - sum((t,m,f), OM_COST_G_VAR(i) * g.L(z,t,i,m,f) );
-AnnProdSurplus(z) = sum(i, AnnSurplusG(z,i)) + sum(k, AnnProfitS(z,k)) + sum((t,n), bal_el.M(z,t) * r.L(z,t,n)) - sum((t,n), OM_COST_R_VAR(z,n) * r.L(z,t,n) );
-AnnSpendingEl(z) =  sum(t, bal_el.M(z,t) * DEMAND(z,t,'el') );
-AnnSpendingHt(z) =  sum(t, bal_ht.M(z,t) * DEMAND(z,t,'ht') );
-AnnSpending(z) =  AnnSpendingEl(z) + AnnSpendingHt(z);
-AvgPriceFuels(z,f) = sum(t, PRICE_FUEL(z,t,f)) / card(t);
-AvgPriceCO2(z) = sum(t, PRICE_CO2(z,t)) / card(t);
-AvgPriceEl(z) = sum(t, bal_el.M(z,t))/card(t);
-AvgPriceHt(z) = sum(t, bal_ht.M(z,t))/card(t);
-HourlyPriceEl(z,t) = bal_el.M(z,t);
-HourlyPriceHt(z,t) = bal_ht.M(z,t);
-HourlyPriceSystemServices(z,t) = lolim_ancservices.M(z,t);
+GenByFuel(z,h,f,e) = sum(t, gen.L(z,h,f,t) * MAP_INPUTS(e,t));
+UseByFuel(z,h,e) = sum(t, use.L(z,h,e,t));
 $offtext
+
 * ==============================================================================
 * THE END
 * ==============================================================================

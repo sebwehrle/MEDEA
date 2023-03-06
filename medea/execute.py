@@ -7,7 +7,7 @@ from itertools import product, repeat
 from gamstransfer import *
 
 
-def run_medea(gams_dir, project_dir, medea_gms, project, run_id, compress=True):
+def run_medea(gams_dir, project_dir, medea_gms, project=None, run_id=None, compress=True):
     """
     flexible run of power system model medea
     :param gams_dir: string of path to GAMS executable
@@ -106,7 +106,10 @@ def create_scenario_gdx(container, gdx_path, dict_base, dict_campaign):
         for n in range(0, len(cart)):
             for par in parms_dict.keys():
                 sym = container.getSymbols(par)
-                sym[0].setRecords(pd.DataFrame(data=[moddf.loc[n, par]]))
+                sym[0].records.loc[:, 'value'] = moddf.loc[n, par]
+                # sym[0].setRecords(pd.DataFrame(data=[moddf.loc[n, par]]))
+                # adjust value setting. Expected format is:
+                # sym[0].setRecords(pd.DataFrame(data=[['s0', 's1', 'value]], columns=['set_0', 'set_1', 'value']))
 
             identifier = '_'.join(map(str, cart[n]))
             input_fname = gdx_path / campaign / f'medea_{identifier}_data.gdx'
